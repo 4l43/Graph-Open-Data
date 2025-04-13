@@ -1,220 +1,231 @@
 import pandas as pd
+import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
-import community
-import numpy as np
+import community as community_louvain
 from matplotlib.lines import Line2D
-from scipy.spatial.distance import pdist, squareform
+from matplotlib import cm
+import matplotlib.patches as mpatches
+from tqdm import tqdm
+from collections import defaultdict
 
-# Charger les données (sélection de 200 lignes aléatoires)
-df_full = pd.read_csv('ValeursYab.csv', sep=';')
-df = df_full.sample(n=200, random_state=74)  # Sélection aléatoire de 200 lignes
+# Configuration initiale
+FICHIER = 'donnéefinalecorrigénormal.csv'
 
-# Liste des paramètres à considérer pour les arêtes
+# Chargement du fichier
+df = pd.read_csv(FICHIER, sep=';', encoding='latin-1', low_memory=False)
+
+# Liste des paramètres
 parametres = [
     'pop1-0',
-    'nb_ecoles_publique1-0',
     'nb_ecoles_publique/pop1-0',
-    'nb_ecoles_prive1-0',
     'nb/ecoles_prive/pop1-0',
-    'nb_ecoles_totale1-0',
     'nb_ecoles_totale/pop1-0',
     'Part de la population éloignée de plus de 20 minutes d\'au moins un des services de santé de proximité 2021  1-0',
     'somme_tauxpourmille_crime 1-0',
     'Taux_Chomage 1-0',
-    'Points',
-    'Points 0-1'
 ]
 
-# Vérifier et nettoyer les paramètres
-valid_params = [p for p in parametres if p in df.columns]
-print(f"Paramètres valides trouvés: {valid_params}")
+# Poids associés
+poids_metriques = {
+    'pop1-0': 0.1,
+    'somme_tauxpourmille_crime 1-0': -0.3,
+    'Taux_Chomage 1-0': -0.5,
+    'nb_ecoles_totale/pop1-0': 0.1,
+    'nb_ecoles_publique/pop1-0': 0.3,
+    'nb/ecoles_prive/pop1-0': 0.3,
+    'Part de la population éloignée de plus de 20 minutes d\'au moins un des services de santé de proximité 2021  1-0': 0.15,
+}
 
-# Préparer les données numériques (remplacer 'E' par 0 et convertir en float)
-df_num = df.copy()
-for param in valid_params:
-    # Remplacer 'E' ou toute chaîne non numérique par 0
-    df_num[param] = pd.to_numeric(df_num[param], errors='coerce').fillna(0)
+# Nettoyage des données
+for col in parametres:
+    if col in df.columns:
+        df[col] = (df[col].astype(str)
+                   .str.replace(',', '.')
+                   .str.replace(' ', '')
+                   .replace(['FAUX', 'NA', 'NaN', 'None', 'null'], '0'))
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-# Calculer la matrice de distance de Gower
-def gower_distance(X):
-    """Calcule la distance de Gower entre toutes les paires d'observations"""
-    n_samples, n_features = X.shape
-    
-    # Calculer les ranges pour normaliser
-    ranges = np.zeros(n_features)
-    for i in range(n_features):
-        ranges[i] = np.max(X[:, i]) - np.min(X[:, i])
-        if ranges[i] == 0:  # Éviter division par zéro
-            ranges[i] = 1
-    
-    # Calculer les distances de Gower entre chaque paire
-    gower_mat = np.zeros((n_samples, n_samples))
-    
-    for i in range(n_samples):
-        for j in range(i+1, n_samples):
-            # Somme des différences absolues normalisées
-            diff_sum = 0
-            valid_features = 0
-            
-            for k in range(n_features):
-                # Si les deux valeurs sont valides
-                if not (np.isnan(X[i, k]) or np.isnan(X[j, k])):
-                    # Différence absolue normalisée
-                    diff_sum += abs(X[i, k] - X[j, k]) / ranges[k]
-                    valid_features += 1
-            
-            # Moyenne des différences si au moins une caractéristique valide
-            if valid_features > 0:
-                gower_mat[i, j] = diff_sum / valid_features
-                gower_mat[j, i] = gower_mat[i, j]  # Symétrie
-    
-    return gower_mat
+# Assurez-vous que la colonne 'Gagnant' existe bien
+if 'Gagnant' not in df.columns:
+    raise KeyError("La colonne 'Gagnant' est absente du fichier.")
 
-# Préparer la matrice des paramètres
-param_matrix = df_num[valid_params].values
+# Nettoyage de la colonne gagnant
+df['Gagnant'] = df['Gagnant'].str.strip().str.upper()
 
-# Calculer la matrice de distance de Gower
-distance_matrix = gower_distance(param_matrix)
+# Filtrage
+parametres_existants = [col for col in parametres if col in df.columns]
+df_clean = df[['libgeo', 'Gagnant'] + parametres_existants].dropna()
 
-# Convertir en matrice de similarité (1 - distance)
-similarity_matrix = 1 - distance_matrix
+# Échantillonnage
+max_communes = 1000
+df_filtered = df_clean.sample(n=min(max_communes, len(df_clean)), random_state=42)
 
-# Définir un seuil de similarité moins strict pour créer plus de communautés
-threshold = 0.1  # Seuil réduit pour obtenir davantage de connexions
+# Matrice de similarité pondérée
+def calculate_weighted_similarity(data, columns, weights):
+    n = len(data)
+    similarity = np.zeros((n, n))
+    weight_sum = sum(weights.values())
+    norm_weights = {k: v / weight_sum for k, v in weights.items()}
+    for i in tqdm(range(n)):
+        for j in range(i+1, n):
+            score = 0
+            for col in columns:
+                if col in norm_weights:
+                    diff = abs(data[col].iloc[i] - data[col].iloc[j])
+                    col_range = data[col].max() - data[col].min()
+                    if col_range > 0:
+                        normalized_diff = diff / col_range
+                        score += norm_weights[col] * (1 - normalized_diff)
+            similarity[i, j] = similarity[j, i] = score
+    return similarity
 
-# Créer une matrice d'adjacence à partir de la matrice de similarité
-adjacency_matrix = similarity_matrix.copy()
-# Mettre à zéro les similarités inférieures au seuil
-adjacency_matrix[adjacency_matrix < threshold] = 0
-# Enlever les boucles (connexions d'un nœud vers lui-même)
-np.fill_diagonal(adjacency_matrix, 0)
+similarity_matrix = calculate_weighted_similarity(df_filtered, parametres_existants, poids_metriques)
 
-# Créer le graphe à partir de la matrice d'adjacence
-G = nx.from_numpy_array(adjacency_matrix)
+# Seuil de similarité - augmenté pour avoir un graphe moins dense
+threshold = np.percentile(similarity_matrix[similarity_matrix > 0], 80)
 
-# Renommer les nœuds avec les codegeo (pour la gestion interne)
-mapping = {i: df['codegeo'].iloc[i] for i in range(len(df))}
-G = nx.relabel_nodes(G, mapping)
+# Création du graphe
+G = nx.Graph()
+communes = df_filtered['libgeo'].tolist()
 
-# Ajouter les attributs aux nœuds
+# Ajouter les nœuds et les arêtes
+for i, commune in enumerate(communes):
+    data_row = df_filtered.iloc[i]
+    G.add_node(commune, gagnant=data_row['Gagnant'], **{p: data_row[p] for p in parametres_existants})
+    for j in range(i+1, len(communes)):
+        if similarity_matrix[i, j] >= threshold:
+            G.add_edge(commune, communes[j], weight=similarity_matrix[i, j])
+
+# Retirer les nœuds isolés
+isolated_nodes = list(nx.isolates(G))
+G.remove_nodes_from(isolated_nodes)
+
+# Détection des communautés
+partition = community_louvain.best_partition(G, weight='weight')
+communities = set(partition.values())
+
+# Palette de couleurs pour les communautés
+community_cmap = cm.get_cmap('tab20', len(communities))
+community_colors = {comm: community_cmap(i) for i, comm in enumerate(communities)}
+
+# Layout avec ajustement pour rapprocher les nœuds
+# Utilisation de la force d'attraction entre communautés différentes
+pos_initial = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
+pos = pos_initial.copy()
+
+# Ajustement du layout pour regrouper par communauté mais avec moins de séparation
 for node in G.nodes():
-    idx = df.index[df['codegeo'] == node].tolist()[0]
-    G.nodes[node]['libgeo'] = df.loc[idx, 'libgeo']
-    G.nodes[node]['gagnant'] = df.loc[idx, 'Gagnant']
+    comm = partition[node]
+    # Décalage plus faible pour réduire l'espacement entre communautés
+    pos[node][0] += community_colors[comm][0] * 0.6
+    pos[node][1] += community_colors[comm][1] * 0.6
 
-# Filtrer les arêtes avec un poids de 0
-for u, v, d in list(G.edges(data=True)):
-    if d['weight'] == 0:
-        G.remove_edge(u, v)
+# Palette de couleurs pour les gagnants
+unique_gagnants = list(set(df_filtered['Gagnant'].unique()))
+gagnant_cmap = cm.get_cmap('Set1', len(unique_gagnants))
+gagnant_to_color = {g: gagnant_cmap(i) for i, g in enumerate(unique_gagnants)}
 
-# Si on a trop d'arêtes, ne garder que les plus fortes
-max_edges = 1000 # A changer si on veut plus de connexions 
-if G.number_of_edges() > max_edges:
-    # Trier les arêtes par poids décroissant
-    edges_with_weights = [(u, v, d['weight']) for u, v, d in G.edges(data=True)]
-    edges_with_weights.sort(key=lambda x: x[2], reverse=True)
-    
-    # Ne garder que les max_edges arêtes les plus fortes
-    edges_to_keep = edges_with_weights[:max_edges]
-    
-    # Recréer le graphe avec seulement ces arêtes
-    G_new = nx.Graph()
-    G_new.add_nodes_from(G.nodes(data=True))
-    for u, v, w in edges_to_keep:
-        G_new.add_edge(u, v, weight=w)
-    G = G_new
+# Calculer les poids moyens des arêtes pour chaque communauté
+community_edge_weights = defaultdict(list)
+for u, v, data in G.edges(data=True):
+    if partition[u] == partition[v]:  # Si les deux nœuds sont dans la même communauté
+        community_edge_weights[partition[u]].append(data['weight'])
 
-# Détection des communautés (Louvain)
-if G.number_of_edges() > 0:
-    partition = community.best_partition(G)
+# Calculer la moyenne des poids pour chaque communauté
+avg_weights = {comm: np.mean(weights) if weights else 0 
+              for comm, weights in community_edge_weights.items()}
+
+# Visualisation améliorée
+plt.figure(figsize=(24, 18))
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
+
+# Dessiner les arêtes avec couleur par communauté
+for u, v, data in G.edges(data=True):
+    if partition[u] == partition[v]:  # Même communauté
+        comm = partition[u]
+        color = community_colors[comm]
+        # Épaisseur proportionnelle au poids
+        width = data['weight'] * 3
+        alpha = min(0.8, data['weight'])
+        plt.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]], 
+                 color=color, linewidth=width, alpha=alpha)
+    else:  # Communautés différentes
+        # Arêtes intercommunautaires plus fines et transparentes
+        plt.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]], 
+                 color='lightgray', linewidth=0.5, alpha=0.2)
+
+# Dessiner les nœuds avec taille en fonction du degré
+node_sizes = [300 * (1 + G.degree(n) / 10) for n in G.nodes()]
+node_colors = [gagnant_to_color[G.nodes[n]['gagnant']] for n in G.nodes()]
+
+nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, 
+                       edgecolors='black', linewidths=0.5, alpha=0.85)
+
+# Sélectionner un sous-ensemble de nœuds pour les étiquettes (pour éviter la surcharge)
+if len(G.nodes()) > 50:
+    # Montrer les libellés uniquement pour les nœuds importants (ex: haut degré)
+    degrees = dict(G.degree())
+    top_nodes = sorted(degrees, key=degrees.get, reverse=True)[:30]
+    labels = {n: f"{n}\n(Comm. {partition[n]})" for n in top_nodes}
 else:
-    print("Aucune arête créée avec ce seuil. Ajustez le seuil de similarité.")
-    partition = {node: 0 for node in G.nodes()}  # Communauté par défaut
+    labels = {n: f"{n}\n(Comm. {partition[n]})" for n in G.nodes()}
 
-# Dictionnaire pour associer chaque parti gagnant à une couleur
-partis_uniques = df['Gagnant'].unique()
-couleurs_partis = {}
-for i, parti in enumerate(partis_uniques):
-    couleurs_partis[parti] = plt.cm.tab10(i % 10)  # Utilisation de la palette tab10
+nx.draw_networkx_labels(G, pos, labels=labels, font_size=8, font_weight='bold', 
+                        font_color='black', bbox=dict(facecolor='white', alpha=0.7, 
+                                                   edgecolor='none', boxstyle='round,pad=0.2'))
 
-# Visualisation
-plt.figure(figsize=(20, 15), dpi=300)
+# Création des éléments de légende pour les gagnants
+legend_elements_gagnants = [
+    Line2D([0], [0], marker='o', color='w', markerfacecolor=color, label=gagnant, 
+         markersize=10, markeredgecolor='black', markeredgewidth=0.5)
+    for gagnant, color in gagnant_to_color.items()
+]
 
-# Layout avec répulsion pour éviter la formation de clusters trop denses
-pos = nx.spring_layout(G, k=0.5, iterations=100, seed=42)  # k élevé = plus de répulsion
+# Création des éléments de légende pour les poids moyens des arêtes par communauté
+legend_elements_weights = []
+for comm, avg_weight in avg_weights.items():
+    legend_elements_weights.append(
+        mpatches.Patch(color=community_colors[comm], 
+                      label=f"Comm. {comm}: poids moy = {avg_weight:.3f}")
+    )
 
-# Coloration des nœuds selon le gagnant
-node_colors = []
-for node in G.nodes():
-    idx = df.index[df['codegeo'] == node].tolist()[0]
-    gagnant = df.loc[idx, 'Gagnant']
-    node_colors.append(couleurs_partis[gagnant])
+# Création de deux zones de légendes séparées (deux axes)
+# Légende des gagnants en haut à gauche
+legend_gagnants = plt.legend(handles=legend_elements_gagnants, 
+                           title="Gagnants", fontsize=10, 
+                           loc="upper left", framealpha=0.9)
 
-# Colorer les nœuds selon leur communauté (bordure)
-node_community_colors = [plt.cm.viridis(partition[node]) for node in G.nodes()]
+# Ajouter la première légende au plot
+plt.gca().add_artist(legend_gagnants)
 
-# Dessin des nœuds
-nx.draw_networkx_nodes(G, pos, node_size=200, node_color=node_colors, alpha=0.8)
+# Légende des poids en bas à droite
+plt.legend(handles=legend_elements_weights, 
+          title="Poids moyens par communauté", fontsize=10, 
+          loc="lower right", framealpha=0.9)
 
-# Les arêtes sont dessinées avec une épaisseur proportionnelle au poids
-if G.number_of_edges() > 0:
-    edge_weights = [G[u][v]['weight'] * 3 for u, v in G.edges()]  # Multiplier par 3 pour mieux voir
-    nx.draw_networkx_edges(G, pos, width=edge_weights, alpha=0.4, edge_color='grey')
+# Titre et annotations
+plt.title("Réseau des communes françaises par similarité pondérée", 
+         fontsize=20, fontweight='bold', pad=20)
+plt.figtext(0.5, 0.01, "Les liens entre communes de même communauté sont colorés selon la communauté. "
+           "L'épaisseur des liens est proportionnelle à leur poids.", 
+           ha='center', fontsize=12)
 
-# Labels avec libgeo au lieu de codegeo
-labels = {node: df.loc[df['codegeo'] == node, 'libgeo'].iloc[0] for node in G.nodes()}
-# Ajuster la taille des labels selon la longueur du texte
-font_sizes = {node: max(4, min(8, 12 - len(label)/3)) for node, label in labels.items()}
-for node, label in labels.items():
-    nx.draw_networkx_labels(G, pos, {node: label}, font_size=font_sizes[node])
-
-# Légende pour les partis politiques
-legend_elements = [Line2D([0], [0], marker='o', color='w', markerfacecolor=color, 
-                          label=parti, markersize=10) for parti, color in couleurs_partis.items()]
-plt.legend(handles=legend_elements, title="Partis politiques", loc="upper right")
-
-plt.title(f"Réseau de communes par similarité (Distance de Gower)\n"
-          f"Arêtes créées si similarité ≥ {threshold} (max {max_edges} arêtes)\n"
-          f"Couleurs des nœuds = Parti gagnant | Groupe = Communautés", fontsize=12)
 plt.axis('off')
+plt.tight_layout()
+plt.savefig("reseau_communes_communautes_ameliore.png", dpi=300, bbox_inches='tight')
 
-# Sauvegarder en PNG
-plt.savefig('reseau_communes_gower_optimise.png', bbox_inches='tight', dpi=300)
-plt.close()
+# Pour visualiser les statistiques des communautés
+community_stats = defaultdict(lambda: {'count': 0, 'gagnants': defaultdict(int)})
+for node, comm in partition.items():
+    community_stats[comm]['count'] += 1
+    community_stats[comm]['gagnants'][G.nodes[node]['gagnant']] += 1
 
-# Afficher quelques statistiques sur le réseau
-print(f"Nombre de nœuds: {G.number_of_nodes()}")
-print(f"Nombre d'arêtes: {G.number_of_edges()}")
-print(f"Nombre de communautés détectées: {len(set(partition.values()))}")
-
-# Examiner le degré moyen et la distribution des degrés
-if G.number_of_nodes() > 0:
-    degrees = [d for n, d in G.degree()]
-    if degrees:
-        print(f"Degré moyen: {sum(degrees)/len(degrees):.2f}")
-        print(f"Degré maximum: {max(degrees)}")
-        print(f"Degré minimum: {min(degrees)}")
-
-# Afficher les communautés
-communautes = {}
-for node, community_id in partition.items():
-    if community_id not in communautes:
-        communautes[community_id] = []
-    communautes[community_id].append(node)
-
-# print("\nListe des communautés détectées:")
-# for comm_id, nodes in communautes.items():
-#     communes = [df.loc[df['codegeo'] == node, 'libgeo'].iloc[0] for node in nodes]
-#     print(f"Communauté {comm_id}: {', '.join(communes)}")
-
-# Calcul et affichage du poids total de chaque communauté
-print("\nListe des communautés détectées avec leur poids total :")
-for comm_id, nodes in communautes.items():
-    # Créer le sous-graphe correspondant à la communauté
-    subG = G.subgraph(nodes)
-    # Calculer le poids total pour les arêtes internes à la communauté
-    poids_total = sum(d['weight'] for u, v, d in subG.edges(data=True))
-    # Récupérer les libellés des communes pour affichage
-    communes = [df.loc[df['codegeo'] == node, 'libgeo'].iloc[0] for node in nodes]
-    print(f"Communauté {comm_id} : {', '.join(communes)}\n  Poids total des arêtes internes: {poids_total:.2f}\n")
+print("\nStatistiques des communautés:")
+for comm, stats in sorted(community_stats.items()):
+    print(f"\nCommunauté {comm}: {stats['count']} communes")
+    print("Répartition des gagnants:")
+    for gagnant, count in stats['gagnants'].items():
+        print(f"  - {gagnant}: {count} ({count/stats['count']*100:.1f}%)")
+    print(f"Poids moyen des liens: {avg_weights.get(comm, 0):.3f}")
